@@ -1,0 +1,20 @@
+{
+  "name": "codefree-o-proxy",
+  "version": "2.7.0",
+  "private": true,
+  "type": "module",
+  "description": "CodeFree-O -> OpenAI 兼容代理（多账号池 / 额度感知自动切换，适配 CodeFree-O Desktop 1.10.x）",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node server.mjs --check",
+    "test:pool": "node --test test/pool.test.mjs",
+    "test:multi-account": "node test/multi-account-acceptance.mjs",
+    "test:pi-web": "node test/pi-web-compat.mjs",
+    "test:pi-web-runtime": "node test/pi-web-runtime-e2e.mjs",
+    "test:pi-web-ui": "node test/pi-web-ui-e2e.mjs"
+  }
+}

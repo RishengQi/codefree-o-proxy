@@ -1,0 +1,23 @@
+[Unit]
+Description=CodeFree-O OpenAI-compatible proxy
+Documentation=file:///opt/codefree-o-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/codefree-o-proxy
+ExecStart=/usr/bin/env node /opt/codefree-o-proxy/server.mjs
+Environment=PORT=8787
+Environment=HOST=127.0.0.1
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+{
+  "excludedPrefixes": [],
+  "replacements": [
+    { "from": "请替换为真实敏感串1", "to": "<REDACTED>" },
+    { "from": "请替换为真实敏感串2", "to": "" }
+  ],
+  "insertions": [
+    {
+      "file": "README.md",
+      "anchor": "- 运行平台：Windows / Linux（Node.js ≥ 20，依赖内置 `fetch`）",
+      "text": "\n\n> 本仓库为脱敏公开版，请自行配置凭据。"
+    }
+  ],
+  "forbidden": ["请替换为真实敏感串1", "请替换为真实敏感串2"],
+  "forbiddenPatterns": ["\\b10001\\b"],
+  "publicRepo": "https://github.com/<owner>/<repo>.git",
+  "description": "脱敏公开版"
+}

@@ -1,0 +1,124 @@
+{
+  "$schema": "https://example.invalid/codefree-o-proxy/config.schema.json",
+  "schemaVersion": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "adminToken": "",
+    "adminTokenEnv": "CODEFREE_ADMIN_TOKEN",
+    "allowRemoteAdmin": false,
+    "maxBodyBytes": 33554432,
+    "shutdownTimeoutMs": 15000,
+    "debug": false
+  },
+  "upstream": {
+    "baseUrl": "https://www.srdcloud.cn",
+    "clientId": "",
+    "clientSecret": "",
+    "signingSecret": "",
+    "version": "1.10.1",
+    "autoDetectVersion": true,
+    "subService": "codefree_o_desktop_chat",
+    "clientTag": "codefreeo",
+    "requestTimeoutMs": 300000,
+    "streamIdleTimeoutMs": 300000,
+    "sessionIdIsolation": false,
+    "refreshTimeoutMs": 15000,
+    "quotaTimeoutMs": 8000
+  },
+  "accounts": [
+    {
+      "id": "acc-a",
+      "label": "研发云账号 A",
+      "baseUrl": "https://www.srdcloud.cn",
+      "userId": "10001",
+      "authFile": "C:/Users/<you>/.codefree-o/.local/share/codefree.json",
+      "writeBack": "mirror",
+      "maxConcurrent": 3,
+      "priority": 0,
+      "tags": ["pool-a"],
+      "enabled": true
+    },
+    {
+      "id": "acc-b",
+      "label": "研发云账号 B",
+      "baseUrl": "https://www.srdcloud.cn",
+      "userId": "10002",
+      "authFile": "<repo>/secrets/acc-b.codefree.json",
+      "writeBack": "isolated",
+      "maxConcurrent": 2,
+      "priority": 0,
+      "tags": ["pool-a"],
+      "enabled": true
+    }
+  ],
+  "imports": {
+    "authfile": {
+      "enabled": false,
+      "path": "",
+      "mode": "mirror"
+    }
+  },
+  "refresh": {
+    "skewMs": 120000,
+    "maxRetries": 3,
+    "backoffMs": [300, 900, 2700],
+    "preRefreshWindowMs": 600000,
+    "startupWarmup": false
+  },
+  "quota": {
+    "enabled": true,
+    "endpoint": "/api/aebackend/quota/v1/me",
+    "assumeUnknownHeadroom": 0.5,
+    "maxAgeMs": 60000,
+    "probe": {
+      "enabled": true,
+      "timeoutMs": 8000,
+      "maxConcurrentProbes": 2,
+      "globalRatePerSec": 1,
+      "perAccountQps": 0.2,
+      "hourlyBudget": 120,
+      "hotMs": 60000,
+      "warmMs": 300000,
+      "coldMs": 1800000,
+      "jitterRatio": 0.2,
+      "backoffMaxMs": 1800000
+    }
+  },
+  "selection": {
+    "stickyTtlMs": 1800000,
+    "stickyMinHeadroom": 0.1,
+    "stickyScoreFactor": 0.6,
+    "maxAttemptsPerRequest": 3,
+    "maxAccountsPerRequest": 2,
+    "maxSameAccountRetries": 1,
+    "weights": { "headroom": 1.0, "health": 0.5, "load": 0.5, "priority": 0.2, "preferred": 0.3 },
+    "cooldown": {
+      "quotaFallbackMs": 300000,
+      "authExpiredMs": 600000,
+      "rateLimitMs": 30000,
+      "upstream5xxMs": 15000,
+      "networkMs": 10000
+    }
+  },
+  "consumers": [
+    {
+      "id": "pi-web",
+      "name": "pi-web 项目",
+      "key": "sk-cf-replace-me",
+      "rpm": 120,
+      "maxConcurrent": 4,
+      "enabled": true
+    }
+  ],
+  "metrics": {
+    "enabled": true
+  },
+  "alert": {
+    "enabled": false,
+    "webhookUrl": "",
+    "cooldownMs": 600000
+  },
+  "stateDir": "./state",
+  "journal": { "enabled": true, "file": "" }
+}

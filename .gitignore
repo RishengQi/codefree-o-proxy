@@ -1,0 +1,25 @@
+# 认证/状态文件，含 token，禁止提交
+.auth-state.json
+codefree.json
+*.bak.proxy.*
+*.bak-codefreeproxy
+config.json
+secrets/
+state/
+
+# 日志与临时文件
+*.log
+*.tmp
+node_modules/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+.admin-token.txt
+
+# ?????????????????????
+scripts/export-public.local.json
+.public-export/
+
+# Python ??
+__pycache__/
