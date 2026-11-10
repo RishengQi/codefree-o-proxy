@@ -64,7 +64,8 @@
     "maxRetries": 3,
     "backoffMs": [300, 900, 2700],
     "preRefreshWindowMs": 600000,
-    "startupWarmup": false
+    "startupWarmup": false,
+    "authRecoveryMs": 600000
   },
   "quota": {
     "enabled": true,
@@ -88,11 +89,16 @@
   "selection": {
     "stickyTtlMs": 1800000,
     "stickyMinHeadroom": 0.1,
+    "maxSessions": 10000,
     "stickyScoreFactor": 0.6,
     "maxAttemptsPerRequest": 3,
     "maxAccountsPerRequest": 2,
     "maxSameAccountRetries": 1,
-    "weights": { "headroom": 1.0, "health": 0.5, "load": 0.5, "priority": 0.2, "preferred": 0.3 },
+    "weights": { "headroom": 1.0, "health": 0.5, "load": 0.5, "priority": 0.2, "preferred": 0.3, "sessions": 0.5 },
+    "sessionBalancing": {
+      "enabled": true,
+      "maxSessionsPerAccount": 0
+    },
     "cooldown": {
       "quotaFallbackMs": 300000,
       "authExpiredMs": 600000,
@@ -116,8 +122,13 @@
   },
   "alert": {
     "enabled": false,
-    "webhookUrl": "",
-    "cooldownMs": 600000
+    "msgType": "text",
+    "cooldownMs": 600000,
+    "accountCooldownMs": 21600000,
+    "quotaWarnPercent": 80,
+    "refreshExpiryWarnHours": 48,
+    "mentionedList": [],
+    "mentionedMobileList": []
   },
   "stateDir": "./state",
   "journal": { "enabled": true, "file": "" }

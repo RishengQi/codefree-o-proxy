@@ -14,18 +14,21 @@ CodeFree-O refresh token 到期巡检（每日定时，剩余 < 2 天或已过�
 重复告警抑制: 同一到期时间 20 小时内只提醒一次（状态存 .expiry-alert.json）
 """
 import argparse
+import http.client
 import json
 import os
-import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILES = [
     os.path.join(BASE_DIR, ".auth-state.json"),
-    "~/.codefree-o/.local/share/codefree.json",
+    os.path.expanduser("~/.codefree-o/.local/share/codefree.json"),
 ]
-ALERT_STATE = os.path.join(BASE_DIR, ".expiry-alert.json")
+# 固定为脚本同目录下的常量文件名；with_name 不接受路径分隔符，避免路径穿越
+ALERT_STATE = Path(__file__).resolve().with_name(".expiry-alert.json")
 DEFAULT_WEBHOOK = os.environ.get("CODEFREE_ALERT_WEBHOOK", "")
 BJ = timezone(timedelta(hours=8))
 SUPPRESS_HOURS = 20
@@ -52,14 +55,18 @@ def load_expiry():
 
 
 def send_wecom(key, text):
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
-    payload = json.dumps({"msgtype": "text", "text": {"content": text}}, ensure_ascii=False)
-    out = subprocess.run(
-        ["curl", "-s", "-m", "15", "-X", "POST", url,
-         "-H", "Content-Type: application/json", "--data-binary", payload],
-        capture_output=True, text=True,
-    )
-    return out.stdout.strip()
+    # 固定企微主机，避免 SSRF；用 http.client 直连，webhook key 不进入进程命令行
+    path = f"/cgi-bin/webhook/send?key={urllib.parse.quote(key, safe='')}"
+    payload = json.dumps({"msgtype": "text", "text": {"content": text}}, ensure_ascii=False).encode("utf-8")
+    conn = http.client.HTTPSConnection("qyapi.weixin.qq.com", timeout=15)
+    try:
+        conn.request("POST", path, body=payload, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.read().decode("utf-8", "replace").strip()
+    except Exception as exc:
+        return json.dumps({"errcode": -1, "errmsg": str(exc)}, ensure_ascii=False)
+    finally:
+        conn.close()
 
 
 def main():
@@ -68,6 +75,8 @@ def main():
     ap.add_argument("--webhook", default=DEFAULT_WEBHOOK)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    if args.webhook and not os.environ.get("CODEFREE_ALERT_WEBHOOK"):
+        log("提示：建议使用环境变量 CODEFREE_ALERT_WEBHOOK，避免 --webhook 出现在命令历史/进程列表")
 
     expires_at, source = load_expiry()
     if not expires_at:
@@ -87,8 +96,7 @@ def main():
 
     # 重复告警抑制：同一到期时间 20 小时内只提醒一次
     try:
-        with open(ALERT_STATE, "r", encoding="utf-8") as fh:
-            prev = json.load(fh)
+        prev = json.loads(ALERT_STATE.read_text(encoding="utf-8"))
     except Exception:
         prev = {}
     last_at = prev.get("lastAlertAt", 0)
@@ -115,9 +123,11 @@ def main():
     resp = send_wecom(args.webhook, text)
     log(f"企微推送返回: {resp}")
     if '"errcode":0' in resp.replace(" ", ""):
-        with open(ALERT_STATE, "w", encoding="utf-8") as fh:
-            json.dump({"lastAlertAt": int(datetime.now().timestamp() * 1000),
-                       "lastAlertExpiresAt": expires_at}, fh)
+        ALERT_STATE.write_text(
+            json.dumps({"lastAlertAt": int(datetime.now().timestamp() * 1000),
+                        "lastAlertExpiresAt": expires_at}),
+            encoding="utf-8",
+        )
     else:
         log("企微推送未成功，状态不更新（下次会重试）")
         return 1

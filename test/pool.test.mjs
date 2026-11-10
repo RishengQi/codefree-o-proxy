@@ -9,6 +9,10 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { startMockUpstream } from './mock-upstream.mjs';
+import { WeComWebhook } from '../lib/wecom.mjs';
+import { AlertManager } from '../lib/alerts.mjs';
+import { SessionAffinity } from '../lib/pool.mjs';
+import { deepMerge } from '../lib/util.mjs';
 
 const REPO = path.resolve(import.meta.dirname, '..');
 
@@ -39,7 +43,7 @@ async function waitFor(fn, { timeoutMs = 20000, intervalMs = 150 } = {}) {
 }
 
 /** 启动一套“mock 上游 + 代理进程”测试环境 */
-async function setup({ accounts, consumers, quotaProbe = false, selection = {}, alert, upstream } = {}) {
+async function setup({ accounts, consumers, quotaProbe = false, selection = {}, alert, upstream, env: extraEnv } = {}) {
   const mock = await startMockUpstream({
     accounts: accounts || {
       'r-a': { accessToken: 'tok-a', userId: '111', fiveHour: { usagePercent: 10, used: 10, limit: 100, resetAt: Date.now() + 3600_000 } },
@@ -95,7 +99,23 @@ async function setup({ accounts, consumers, quotaProbe = false, selection = {}, 
 
   const child = spawn(process.execPath, ['server.mjs'], {
     cwd: REPO,
-    env: { ...process.env, CODEFREE_CONFIG: cfgPath, PORT: String(port), CODEFREE_DEBUG: '' },
+    env: {
+      ...process.env,
+      CODEFREE_CONFIG: cfgPath,
+      PORT: String(port),
+      CODEFREE_DEBUG: '',
+      // 避免开发机上的真实告警配置影响测试；用例需要时通过 env 显式传入
+      CODEFREE_ALERT_WEBHOOK: '',
+      CODEFREE_ALERT_WEBHOOK_TIMEOUT_MS: '',
+      CODEFREE_ALERT_COOLDOWN_MS: '',
+      CODEFREE_ALERT_ACCOUNT_COOLDOWN_MS: '',
+      CODEFREE_QUOTA_WARN_PERCENT: '',
+      CODEFREE_ALERT_MSG_TYPE: '',
+      CODEFREE_ALERT_MENTION: '',
+      CODEFREE_ALERT_MENTION_MOBILE: '',
+      CODEFREE_REFRESH_WARN_HOURS: '',
+      ...(extraEnv || {}),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logs = [];
@@ -143,6 +163,45 @@ async function setup({ accounts, consumers, quotaProbe = false, selection = {}, 
 
 function chatCalls(mock) {
   return mock.requests().filter((r) => r.path === '/api/acbackend/codechat/v1/completions');
+}
+
+/** 本地企微 webhook 接收端 */
+async function startAlertHook() {
+  const captured = [];
+  const hook = http.createServer((req, res) => {
+    let buf = '';
+    req.on('data', (d) => (buf += d.toString()));
+    req.on('end', () => {
+      try {
+        captured.push(JSON.parse(buf));
+      } catch {
+        captured.push(buf);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"errcode":0}');
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  return {
+    url: `http://127.0.0.1:${hook.address().port}/hook`,
+    captured,
+    close: () => new Promise((r) => hook.close(r)),
+  };
+}
+
+function alertContent(body) {
+  if (typeof body === 'string') return body;
+  return body?.text?.content || body?.markdown?.content || '';
+}
+
+async function waitForAlert(captured, predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = captured.find((b) => predicate(alertContent(b), b));
+    if (found) return found;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return null;
 }
 
 test('健康检查 + 模型列表（多账号池模式）', async () => {
@@ -349,22 +408,10 @@ test('Prometheus 指标与管理面用量持久化', async () => {
 });
 
 test('全池额度耗尽触发告警 webhook', async () => {
-  // 本地 webhook 接收端
-  const captured = [];
-  const hook = http.createServer((req, res) => {
-    let buf = '';
-    req.on('data', (d) => (buf += d.toString()));
-    req.on('end', () => {
-      try { captured.push(JSON.parse(buf)); } catch { captured.push(buf); }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{"errcode":0}');
-    });
-  });
-  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
-  const hookPort = hook.address().port;
+  const hook = await startAlertHook();
   const env = await setup({
     quotaProbe: true,
-    alert: { enabled: true, webhookUrl: `http://127.0.0.1:${hookPort}/hook`, cooldownMs: 1000 },
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
   });
   try {
     await env.admin('/admin/quota/probe');
@@ -373,15 +420,15 @@ test('全池额度耗尽触发告警 webhook', async () => {
     const res = await env.chat();
     assert.equal(res.status, 429);
     // 等待告警评估与发送
-    for (let i = 0; i < 20 && captured.length === 0; i++) await new Promise((r) => setTimeout(r, 200));
-    assert.ok(captured.length >= 1, '未收到告警 webhook');
-    const body = captured[0];
-    const content = typeof body === 'string' ? body : body?.text?.content || '';
-    assert.match(content, /全池额度耗尽/);
-    assert.match(content, /acc-a/);
+    const poolMsg = await waitForAlert(hook.captured, (c) => c.includes('全池额度耗尽'));
+    assert.ok(poolMsg, '未收到全池额度耗尽告警');
+    assert.match(alertContent(poolMsg), /acc-a/);
+    // 同时应有账号级额度耗尽告警
+    const accountMsg = await waitForAlert(hook.captured, (c) => c.includes('账号额度耗尽') && c.includes('acc-a'));
+    assert.ok(accountMsg, '未收到账号级额度耗尽告警');
   } finally {
     await env.close();
-    await new Promise((r) => hook.close(r));
+    await hook.close();
   }
 });
 
@@ -710,4 +757,851 @@ test('额度状态信息指标（quotaStatus / statusReason）', async () => {
   } finally {
     await env.close();
   }
+});
+
+test('按会话负载均衡：新 session 在账号间均匀分布', async () => {
+  const env = await setup({ quotaProbe: true });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await env.mock.control({ resetLogs: true });
+    for (let i = 0; i < 6; i++) {
+      const res = await env.chat({ session_id: `balance-${i}` });
+      assert.equal(res.status, 200);
+    }
+    const counts = {};
+    for (const call of chatCalls(env.mock)) counts[call.account] = (counts[call.account] || 0) + 1;
+    assert.deepEqual(counts, { 'r-a': 3, 'r-b': 3 }, '6 个新 session 应均匀分到两个账号');
+
+    const health = await (await fetch(env.base + '/health')).json();
+    assert.equal(health.pool.stickySessions, 6);
+    assert.deepEqual(health.pool.sessionsByAccount, { 'acc-a': 3, 'acc-b': 3 });
+    assert.equal(health.accountsDetail.find((a) => a.id === 'acc-a').sessions, 3);
+
+    const metrics = await (await fetch(env.base + '/metrics')).text();
+    assert.match(metrics, /codefree_account_sessions\{[^}]*account="acc-a"[^}]*\} 3/);
+    assert.match(metrics, /codefree_account_sessions\{[^}]*account="acc-b"[^}]*\} 3/);
+  } finally {
+    await env.close();
+  }
+});
+
+test('会话硬绑定：原账号余量达标时不被更高评分账号抢走', async () => {
+  const env = await setup({
+    quotaProbe: true,
+    // 关掉软粘性加分与会话负载项，确保同 session 保持原账号只能靠硬绑定
+    selection: { stickyScoreFactor: 0, weights: { sessions: 0 } },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const first = await env.chat({ session_id: 'pin-1' });
+    assert.equal(first.status, 200);
+    const pinned = chatCalls(env.mock).at(-1).account;
+    const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+    // 已绑定账号余量 15%（>= stickyMinHeadroom 0.1），另一账号 95%：评分明显偏向另一账号
+    const patch = {
+      [pinned]: { fiveHour: { usagePercent: 85, used: 85, limit: 100, resetAt: Date.now() + 3600_000 } },
+      [other]: { fiveHour: { usagePercent: 5, used: 5, limit: 100, resetAt: Date.now() + 3600_000 } },
+    };
+    await env.mock.control({ accounts: patch });
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+
+    const second = await env.chat({ session_id: 'pin-1' });
+    assert.equal(second.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, pinned, '硬绑定应优先于额度评分');
+
+    // 余量低于阈值后应允许漂移
+    patch[pinned] = { fiveHour: { usagePercent: 95, used: 95, limit: 100, resetAt: Date.now() + 3600_000 } };
+    await env.mock.control({ accounts: patch });
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const third = await env.chat({ session_id: 'pin-1' });
+    assert.equal(third.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, other, '余量低于 stickyMinHeadroom 后应漂移');
+  } finally {
+    await env.close();
+  }
+});
+
+test('同一 session 并发首请求：选中即绑定，命中同一账号', async () => {
+  const env = await setup();
+  try {
+    const results = await Promise.all([env.chat({ session_id: 'concurrent-1' }), env.chat({ session_id: 'concurrent-1' })]);
+    assert.ok(results.every((r) => r.status === 200));
+    const accounts = new Set(chatCalls(env.mock).map((c) => c.account));
+    assert.equal(accounts.size, 1, `并发首请求应命中同一账号，实际：${[...accounts].join(',')}`);
+  } finally {
+    await env.close();
+  }
+});
+
+test('会话失败漂移：换号后重新绑定，不回到原账号', async () => {
+  const env = await setup();
+  try {
+    await env.chat({ session_id: 'fail-1' });
+    const pinned = chatCalls(env.mock).at(-1).account;
+    const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+    await env.mock.control({ accounts: { [pinned]: { chat: '500' } } });
+    const res = await env.chat({ session_id: 'fail-1' });
+    assert.equal(res.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, other, '失败应换号');
+
+    await env.mock.control({ accounts: { [pinned]: { chat: 'ok' } } });
+    const res2 = await env.chat({ session_id: 'fail-1' });
+    assert.equal(res2.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, other, '换号后应重新绑定到新账号');
+  } finally {
+    await env.close();
+  }
+});
+
+test('maxSessionsPerAccount：新会话避开已达上限的账号，全满时仍均摊', async () => {
+  const env = await setup({ selection: { sessionBalancing: { enabled: true, maxSessionsPerAccount: 1 } } });
+  try {
+    for (const sid of ['cap-1', 'cap-2', 'cap-3', 'cap-4']) {
+      const res = await env.chat({ session_id: sid });
+      assert.equal(res.status, 200);
+    }
+    const calls = chatCalls(env.mock);
+    assert.notEqual(calls[0].account, calls[1].account, '前两个 session 应分到不同账号');
+    const counts = {};
+    for (const c of calls) counts[c.account] = (counts[c.account] || 0) + 1;
+    assert.deepEqual(counts, { 'r-a': 2, 'r-b': 2 }, '达到上限后溢出会话仍应均摊，而不是堆到同一账号');
+
+    const health = await (await fetch(env.base + '/health')).json();
+    assert.equal(health.pool.stickySessions, 4);
+  } finally {
+    await env.close();
+  }
+});
+
+test('会话 TTL 过期后重新按评分选号', async () => {
+  const env = await setup({ quotaProbe: true, selection: { stickyTtlMs: 100 } });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await env.chat({ session_id: 'ttl-1' });
+    const pinned = chatCalls(env.mock).at(-1).account;
+    const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+    const patch = {
+      [pinned]: { fiveHour: { usagePercent: 85, used: 85, limit: 100, resetAt: Date.now() + 3600_000 } },
+      [other]: { fiveHour: { usagePercent: 5, used: 5, limit: 100, resetAt: Date.now() + 3600_000 } },
+    };
+    await env.mock.control({ accounts: patch });
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await new Promise((r) => setTimeout(r, 150));
+
+    const res = await env.chat({ session_id: 'ttl-1' });
+    assert.equal(res.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, other, 'TTL 过期后应重新选号');
+  } finally {
+    await env.close();
+  }
+});
+
+test('账号登录失效触发 webhook（单账号）', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
+  });
+  try {
+    // acc-a 的 chat 持续 401；刷新后仍失败 → auth-expired，请求切到 acc-b 成功
+    await env.mock.control({ accounts: { 'r-a': { chat: '401' } } });
+    const res = await env.chat({ session_id: 'auth-alert' });
+    assert.equal(res.status, 200, '应 failover 到正常账号');
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号登录失效'));
+    assert.ok(msg, '未收到账号登录失效告警');
+    const content = alertContent(msg);
+    assert.match(content, /acc-a/);
+    assert.doesNotMatch(content, /全池登录失效/);
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('额度预警触发 webhook（回退阈值 80%）', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000, quotaWarnPercent: 80 },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        fiveHour: { usagePercent: 85, used: 85, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': {
+        accessToken: 'tok-b',
+        userId: '222',
+        fiveHour: { usagePercent: 10, used: 10, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号额度预警') && c.includes('acc-a'));
+    assert.ok(msg, '未收到额度预警');
+    const content = alertContent(msg);
+    assert.match(content, /5H/);
+    assert.match(content, /85%/);
+    assert.match(content, /阈值 80%/);
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('账号额度耗尽触发 webhook', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        fiveHour: { usagePercent: 100, used: 100, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': {
+        accessToken: 'tok-b',
+        userId: '222',
+        fiveHour: { usagePercent: 10, used: 10, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号额度耗尽') && c.includes('acc-a'));
+    assert.ok(msg, '未收到账号额度耗尽告警');
+    assert.match(alertContent(msg), /5H/);
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('账号被服务端管控触发 webhook', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
+    accounts: {
+      'r-a': { accessToken: 'tok-a', userId: '111', quotaStatus: 'DISABLED', statusReason: 'CONTROL_DISABLED' },
+      'r-b': { accessToken: 'tok-b', userId: '222' },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号被管控') && c.includes('acc-a'));
+    assert.ok(msg, '未收到账号被管控告警');
+    assert.match(alertContent(msg), /CONTROL_DISABLED/);
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('上游 5xx 触发账号异常 webhook', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
+  });
+  try {
+    await env.mock.control({ accounts: { 'r-a': { chat: '500' } } });
+    const res = await env.chat({ session_id: 'upstream-alert' });
+    assert.equal(res.status, 200, '应 failover 到正常账号');
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号上游异常') && c.includes('acc-a'));
+    assert.ok(msg, '未收到账号上游异常告警');
+    assert.match(alertContent(msg), /upstream_500/);
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('企微 markdown 消息格式', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    alert: { enabled: true, webhookUrl: hook.url, msgType: 'markdown', cooldownMs: 1000 },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        fiveHour: { usagePercent: 90, used: 90, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': { accessToken: 'tok-b', userId: '222' },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号额度预警'));
+    assert.ok(msg, '未收到 markdown 告警');
+    assert.equal(msg.msgtype, 'markdown');
+    assert.ok(msg.markdown?.content?.includes('账号额度预警'));
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('webhook 通过环境变量 CODEFREE_ALERT_WEBHOOK 配置', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    env: { CODEFREE_ALERT_WEBHOOK: hook.url },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        fiveHour: { usagePercent: 90, used: 90, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': { accessToken: 'tok-b', userId: '222' },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号额度预警'));
+    assert.ok(msg, '未收到环境变量配置的 webhook 告警');
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('关闭会话负载均衡后恢复旧软粘性', async () => {
+  const env = await setup({
+    quotaProbe: true,
+    selection: { sessionBalancing: { enabled: false }, stickyScoreFactor: 5 },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await env.chat({ session_id: 'legacy-sticky' });
+    const pinned = chatCalls(env.mock).at(-1).account;
+    const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+    const patch = {
+      [pinned]: { fiveHour: { usagePercent: 85, used: 85, limit: 100, resetAt: Date.now() + 3600_000 } },
+      [other]: { fiveHour: { usagePercent: 5, used: 5, limit: 100, resetAt: Date.now() + 3600_000 } },
+    };
+    await env.mock.control({ accounts: patch });
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+
+    const res = await env.chat({ session_id: 'legacy-sticky' });
+    assert.equal(res.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, pinned, '关闭负载均衡后应由 stickyScoreFactor 保持软粘性');
+  } finally {
+    await env.close();
+  }
+});
+
+test('BYPASSED / VIP 账号不触发额度预警', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({
+    quotaProbe: true,
+    alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        quotaStatus: 'BYPASSED',
+        fiveHour: { usagePercent: 95, used: 95, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': {
+        accessToken: 'tok-b',
+        userId: '222',
+        vip: true,
+        fiveHour: { usagePercent: 95, used: 95, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await new Promise((r) => setTimeout(r, 500));
+    const quotaAlerts = hook.captured.filter((b) => /账号额度(预警|耗尽)/.test(alertContent(b)));
+    assert.equal(quotaAlerts.length, 0, 'BYPASSED/VIP 账号不应产生额度告警');
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('企微 webhook 识别 errcode 非 0 与非 JSON 响应', async () => {
+  const bad = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"errcode":40058,"errmsg":"invalid webhook url"}');
+  });
+  await new Promise((r) => bad.listen(0, '127.0.0.1', r));
+  const html = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<html>gateway error</html>');
+  });
+  await new Promise((r) => html.listen(0, '127.0.0.1', r));
+  try {
+    const wc1 = new WeComWebhook({ url: `http://127.0.0.1:${bad.address().port}/hook` });
+    const r1 = await wc1.send('hello');
+    assert.equal(r1.ok, false);
+    assert.equal(r1.errcode, 40058);
+
+    const wc2 = new WeComWebhook({ url: `http://127.0.0.1:${html.address().port}/hook` });
+    const r2 = await wc2.send('hello');
+    assert.equal(r2.ok, false, 'HTTP 200 但非 JSON 应视为失败');
+  } finally {
+    await new Promise((r) => bad.close(r));
+    await new Promise((r) => html.close(r));
+  }
+});
+
+test('池级额度恢复：冷却到期后不再卡在 all_quota_exhausted', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: 'quota_exhausted',
+    cooldownUntil: Date.now() + 60_000,
+    stats: {},
+  };
+  const pool = { list: () => [account] };
+  const quota = {
+    get: () => ({
+      exhausted: true,
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 100, resetAt: Date.now() + 60_000 } },
+    }),
+  };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 'test' });
+    assert.ok(await waitForAlert(hook.captured, (c) => c.includes('全池额度耗尽')));
+
+    // 冷却已到期且额度探测恢复：应发池级恢复，而不是被旧的 cooldownReason 卡住
+    account.cooldownUntil = Date.now() - 1000;
+    quota.get = () => ({
+      exhausted: false,
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 10, resetAt: Date.now() + 60_000 } },
+    });
+    await alerts.evaluate(pool, quota, { reason: 'test' });
+    assert.ok(await waitForAlert(hook.captured, (c) => c.includes('已恢复')));
+  } finally {
+    await hook.close();
+  }
+});
+
+test('被动快照缺少额度门控字段时不告警', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({ config: { alert: { enabled: true, webhookUrl: hook.url } }, logger: null });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: '',
+    cooldownUntil: 0,
+    stats: {},
+  };
+  // 只有被动 usagePercent，没有 enforced/quotaStatus/statusReason/vip：应视为未知，不告警
+  const quota = { get: () => ({ windows: { '5H': { usagePercent: 85, thresholdPercent: 70 } } }) };
+  try {
+    await alerts.evaluate({ list: () => [account] }, quota, { reason: 'passive' });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('账号额度预警')).length, 0);
+  } finally {
+    await hook.close();
+  }
+});
+
+test('额度预警优先使用服务端 thresholdPercent', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, quotaWarnPercent: 80 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: '',
+    cooldownUntil: 0,
+    stats: {},
+  };
+  // 75% 低于回退阈值 80%，但高于服务端 thresholdPercent 70% → 应预警
+  const quota = {
+    get: () => ({
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 75, thresholdPercent: 70, resetAt: Date.now() + 3600_000 } },
+    }),
+  };
+  try {
+    await alerts.evaluate({ list: () => [account] }, quota, { reason: 'passive' });
+    const msg = await waitForAlert(hook.captured, (c) => c.includes('账号额度预警'));
+    assert.ok(msg, '服务端阈值 70% 时应触发预警');
+    assert.match(alertContent(msg), /阈值 70%/);
+  } finally {
+    await hook.close();
+  }
+});
+
+test('硬绑定余量不达标时换到其他账号', async () => {
+  const env = await setup({ quotaProbe: true, selection: { weights: { sessions: 0 } } });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    await env.chat({ session_id: 'headroom-drift' });
+    const pinned = chatCalls(env.mock).at(-1).account;
+    const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+    // 原账号余量 5%、另一账号 2%：原账号评分更高，但低于 stickyMinHeadroom 应换号
+    const patch = {
+      [pinned]: { fiveHour: { usagePercent: 95, used: 95, limit: 100, resetAt: Date.now() + 3600_000 } },
+      [other]: { fiveHour: { usagePercent: 98, used: 98, limit: 100, resetAt: Date.now() + 3600_000 } },
+    };
+    await env.mock.control({ accounts: patch });
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+
+    const res = await env.chat({ session_id: 'headroom-drift' });
+    assert.equal(res.status, 200);
+    assert.equal(chatCalls(env.mock).at(-1).account, other, '原账号余量低于阈值时应换号，即使它的评分更高');
+  } finally {
+    await env.close();
+  }
+});
+
+test('admin refresh 恢复 auth-expired 账号并发送恢复告警', async () => {
+  const hook = await startAlertHook();
+  const env = await setup({ alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 1000 } });
+  try {
+    // acc-a 持续 401 → auth-expired；请求 failover 到 acc-b
+    await env.mock.control({ accounts: { 'r-a': { chat: '401' } } });
+    const res = await env.chat({ session_id: 'auth-recover' });
+    assert.equal(res.status, 200);
+    let accounts = (await (await env.admin('/admin/accounts')).json()).accounts;
+    assert.equal(accounts.find((a) => a.id === 'acc-a').health, 'auth-expired');
+    assert.ok(await waitForAlert(hook.captured, (c) => c.includes('账号登录失效')));
+
+    // 上游恢复后，管理员强制刷新应清除 auth-expired 并发送恢复告警
+    await env.mock.control({ accounts: { 'r-a': { chat: 'ok' } } });
+    const refresh = await env.admin('/admin/accounts/acc-a/refresh', { method: 'POST' });
+    assert.equal(refresh.status, 200);
+    accounts = (await (await env.admin('/admin/accounts')).json()).accounts;
+    assert.equal(accounts.find((a) => a.id === 'acc-a').health, 'ready');
+    assert.ok(await waitForAlert(hook.captured, (c) => c.includes('账号登录已恢复')));
+  } finally {
+    await env.close();
+    await hook.close();
+  }
+});
+
+test('SessionAffinity：容量淘汰最旧映射且计数一致', () => {
+  const affinity = new SessionAffinity({
+    config: { selection: { stickyTtlMs: 60000, maxSessions: 2 } },
+    logger: null,
+  });
+  affinity.set('c', 's1', 'a');
+  affinity.set('c', 's2', 'b');
+  assert.equal(affinity.size(), 2);
+  assert.equal(affinity.countByAccount('a'), 1);
+  assert.equal(affinity.countByAccount('b'), 1);
+
+  affinity.set('c', 's3', 'a');
+  assert.equal(affinity.size(), 2);
+  assert.equal(affinity.get('c', 's1'), null, '最旧映射应被淘汰');
+  assert.equal(affinity.countByAccount('a'), 1);
+  assert.equal(affinity.countByAccount('b'), 1);
+});
+
+test('SessionAffinity：读取计数前清理过期映射', async () => {
+  const affinity = new SessionAffinity({
+    config: { selection: { stickyTtlMs: 20, maxSessions: 100 } },
+    logger: null,
+  });
+  affinity.set('c', 's1', 'a');
+  assert.equal(affinity.countByAccount('a'), 1);
+  await new Promise((r) => setTimeout(r, 30));
+  affinity.lastSweepAt = 0; // 强制下一次读取触发 sweep
+  assert.equal(affinity.countByAccount('a'), 0);
+  assert.equal(affinity.size(), 0);
+});
+
+test('会话键来源：body.sessionId / x-session-affinity / x-session-id 均可硬绑定', async () => {
+  const variants = [
+    { name: 'body.sessionId', headers: {}, body: { sessionId: 'variant-body' } },
+    { name: 'x-session-affinity', headers: { 'x-session-affinity': 'variant-aff' }, body: {} },
+    { name: 'x-session-id', headers: { 'x-session-id': 'variant-sid' }, body: {} },
+  ];
+  for (const variant of variants) {
+    const env = await setup({ quotaProbe: true });
+    try {
+      await env.admin('/admin/quota/probe', { method: 'POST' });
+      const send = () =>
+        fetch(`${env.base}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...variant.headers },
+          body: JSON.stringify({
+            model: 'GLM-5.2',
+            messages: [{ role: 'user', content: 'hi' }],
+            stream: false,
+            ...variant.body,
+          }),
+        });
+
+      assert.equal((await send()).status, 200);
+      const pinned = chatCalls(env.mock).at(-1).account;
+      const other = pinned === 'r-a' ? 'r-b' : 'r-a';
+
+      // 让另一账号余量明显更好，同 session 仍应硬绑定在原账号
+      const patch = {
+        [pinned]: { fiveHour: { usagePercent: 85, used: 85, limit: 100, resetAt: Date.now() + 3600_000 } },
+        [other]: { fiveHour: { usagePercent: 5, used: 5, limit: 100, resetAt: Date.now() + 3600_000 } },
+      };
+      await env.mock.control({ accounts: patch });
+      await env.admin('/admin/quota/probe', { method: 'POST' });
+
+      assert.equal((await send()).status, 200);
+      assert.equal(chatCalls(env.mock).at(-1).account, pinned, `${variant.name} 应保持硬绑定`);
+    } finally {
+      await env.close();
+    }
+  }
+});
+
+test('告警去重：auth-expired 在冷却期内不重复，到期后提醒', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, accountCooldownMs: 50 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'auth-expired',
+    cooldownReason: 'auth_expired',
+    cooldownUntil: Date.now() + 60_000,
+    stats: { lastError: '401' },
+  };
+  const pool = { list: () => [account] };
+  const quota = { get: () => null };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 't1' });
+    await alerts.evaluate(pool, quota, { reason: 't2' });
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('账号登录失效')).length, 1);
+
+    await new Promise((r) => setTimeout(r, 60));
+    await alerts.evaluate(pool, quota, { reason: 't3' });
+    assert.equal(
+      hook.captured.filter((b) => alertContent(b).includes('账号登录失效')).length,
+      2,
+      '冷却到期后应再次提醒',
+    );
+  } finally {
+    await hook.close();
+  }
+});
+
+test('告警去重：额度预警按窗口 resetAt 去重', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, quotaWarnPercent: 80 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: '',
+    cooldownUntil: 0,
+    stats: {},
+  };
+  const resetAt = Date.now() + 3600_000;
+  let snap = {
+    enforced: true,
+    quotaStatus: 'ACTIVE',
+    windows: { '5H': { usagePercent: 85, thresholdPercent: 80, resetAt } },
+  };
+  const pool = { list: () => [account] };
+  const quota = { get: () => snap };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 't1' });
+    await alerts.evaluate(pool, quota, { reason: 't2' });
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('账号额度预警')).length, 1);
+
+    // 同一窗口（resetAt 未变）不重复；新窗口应重新预警
+    snap = { ...snap, windows: { '5H': { ...snap.windows['5H'], resetAt: resetAt + 1 } } };
+    await alerts.evaluate(pool, quota, { reason: 't3' });
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('账号额度预警')).length, 2);
+  } finally {
+    await hook.close();
+  }
+});
+
+test('告警冷却：池级事件在 cooldownMs 内不重复，恢复后发送', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, cooldownMs: 50 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: 'quota_exhausted',
+    cooldownUntil: Date.now() + 60_000,
+    stats: {},
+  };
+  const pool = { list: () => [account] };
+  let snap = {
+    exhausted: true,
+    enforced: true,
+    quotaStatus: 'ACTIVE',
+    windows: { '5H': { usagePercent: 100, resetAt: Date.now() + 60_000 } },
+  };
+  const quota = { get: () => snap };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 't1' });
+    await alerts.evaluate(pool, quota, { reason: 't2' });
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('全池额度耗尽')).length, 1);
+
+    await new Promise((r) => setTimeout(r, 60));
+    await alerts.evaluate(pool, quota, { reason: 't3' });
+    assert.equal(hook.captured.filter((b) => alertContent(b).includes('全池额度耗尽')).length, 2);
+
+    account.cooldownUntil = Date.now() - 1000;
+    snap = {
+      exhausted: false,
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 10, resetAt: Date.now() + 60_000 } },
+    };
+    await alerts.evaluate(pool, quota, { reason: 't4' });
+    assert.ok(await waitForAlert(hook.captured, (c) => c.includes('已恢复')));
+  } finally {
+    await hook.close();
+  }
+});
+
+test('告警发送失败后下一次评估重试', async () => {
+  let calls = 0;
+  const hook = http.createServer((req, res) => {
+    calls++;
+    req.on('data', () => {});
+    req.on('end', () => {
+      if (calls === 1) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end('{"errcode":500}');
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"errcode":0}');
+      }
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: `http://127.0.0.1:${hook.address().port}/hook` } },
+    logger: null,
+  });
+  const bad = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'auth-expired',
+    cooldownReason: 'auth_expired',
+    cooldownUntil: Date.now() + 60_000,
+    stats: {},
+  };
+  const good = {
+    id: 'acc-b',
+    userId: '222',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: '',
+    cooldownUntil: 0,
+    stats: {},
+  };
+  const pool = { list: () => [bad, good] };
+  const quota = { get: () => null };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 't1' });
+    assert.equal(calls, 1, '第一次发送应失败');
+    await alerts.evaluate(pool, quota, { reason: 't2' });
+    assert.equal(calls, 2, '发送失败后下一次评估应重试');
+  } finally {
+    await new Promise((r) => hook.close(r));
+  }
+});
+
+test('企微 text 消息支持 @ 成员', async () => {
+  const hook = await startAlertHook();
+  const wc = new WeComWebhook({
+    url: hook.url,
+    mentionedList: ['@all'],
+    mentionedMobileList: ['13800000000'],
+  });
+  try {
+    const res = await wc.send('hello');
+    assert.equal(res.ok, true);
+    const body = hook.captured[0];
+    assert.equal(body.msgtype, 'text');
+    assert.equal(body.text.content, 'hello');
+    assert.deepEqual(body.text.mentioned_list, ['@all']);
+    assert.deepEqual(body.text.mentioned_mobile_list, ['13800000000']);
+  } finally {
+    await hook.close();
+  }
+});
+
+test('企微消息按 UTF-8 字节上限截断', async () => {
+  const hook = await startAlertHook();
+  try {
+    const textClient = new WeComWebhook({ url: hook.url });
+    await textClient.send('中'.repeat(2000)); // 6000 bytes
+    const textBody = hook.captured[0];
+    assert.ok(Buffer.byteLength(textBody.text.content, 'utf8') <= 2048);
+    assert.match(textBody.text.content, /消息已截断/);
+
+    const mdClient = new WeComWebhook({ url: hook.url, msgType: 'markdown' });
+    await mdClient.send('中'.repeat(2000));
+    const mdBody = hook.captured[1];
+    assert.equal(mdBody.msgtype, 'markdown');
+    assert.ok(Buffer.byteLength(mdBody.markdown.content, 'utf8') <= 4096);
+    assert.match(mdBody.markdown.content, /消息已截断/);
+  } finally {
+    await hook.close();
+  }
+});
+
+test('deepMerge 忽略原型污染键', () => {
+  const patch = JSON.parse('{"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}},"a":2}');
+  const out = deepMerge({ a: 1 }, patch);
+  assert.equal(out.a, 2);
+  assert.equal({}.polluted, undefined);
+  assert.equal(out.polluted, undefined);
+});
+
+test('企微 webhook 拒绝非 http/https 协议', async () => {
+  const wc = new WeComWebhook({ url: 'file:///etc/passwd' });
+  assert.equal(wc.enabled, false);
+  const res = await wc.send('x');
+  assert.equal(res.ok, false);
+  assert.equal(res.skipped, true);
 });

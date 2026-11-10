@@ -6,7 +6,7 @@
 //   配置(config.json) -> 账号池(AccountPool) -> 额度服务(QuotaService) -> 选择器(AccountSelector)
 //   -> 上游(UpstreamClient) -> OpenAI /v1/* 或管理面 /admin/*
 import http from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -43,11 +43,11 @@ function buildRuntime(cfg, logger) {
   const journal = new Journal({ file: cfg.journal.file, enabled: cfg.journal.enabled, logger });
   const quota = new QuotaService({ config: cfg, logger });
   const upstream = new UpstreamClient({ config: cfg, logger });
-  const pool = new AccountPool({ config: cfg, logger, upstream, journal, quota });
-  const affinity = new SessionAffinity({ config: cfg, logger });
-  const selector = new AccountSelector({ config: cfg, logger, pool, quota, affinity });
-  const consumers = new ConsumerLimiter({ config: cfg, logger });
   const alerts = new AlertManager({ config: cfg, logger });
+  const pool = new AccountPool({ config: cfg, logger, upstream, journal, quota, alerts });
+  const affinity = new SessionAffinity({ config: cfg, logger });
+  const selector = new AccountSelector({ config: cfg, logger, pool, quota, affinity, alerts });
+  const consumers = new ConsumerLimiter({ config: cfg, logger });
   return { journal, quota, upstream, pool, affinity, selector, consumers, alerts };
 }
 
@@ -121,9 +121,9 @@ function sessionKeyOf(body, req) {
 }
 
 async function handleHealth(ctx, req, res) {
-  const { pool, quota, config } = ctx;
+  const { pool, quota, config, affinity } = ctx;
   const accounts = pool.list();
-  const snapshot = pool.snapshot();
+  const snapshot = pool.snapshot().map((s) => ({ ...s, sessions: affinity.countByAccount(s.id) }));
   const ready = accounts.filter((a) => a.available).length;
   const single = accounts.length <= 1 ? accounts[0] : null;
   const quotaSummary = single ? quota.get(single.id) : null;
@@ -145,7 +145,8 @@ async function handleHealth(ctx, req, res) {
     pool: {
       available: ready,
       activeLeases: accounts.reduce((s, a) => s + a.leases, 0),
-      stickySessions: ctx.affinity.size(),
+      stickySessions: affinity.size(),
+      sessionsByAccount: affinity.countsByAccount(),
     },
     accountsDetail: snapshot,
     quota: single
@@ -535,7 +536,11 @@ async function handleChat(ctx, req, res) {
         try {
           const parsed = JSON.parse(text);
           const signal = extractQuotaSignal(parsed);
-          if (signal && quotaPassiveEnabled) quota.recordPassive(account.id, signal);
+          if (signal && quotaPassiveEnabled) {
+            quota.recordPassive(account.id, signal);
+            // 成功响应里也可能带 QUOTA_WARNING：立即评估账号级额度预警
+            ctx.alerts?.evaluate(ctx.pool, ctx.quota, { reason: 'quota_signal' }).catch(() => {});
+          }
         } catch {}
         res.writeHead(upstreamRes.status, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
         res.end(text);
@@ -785,6 +790,13 @@ function isLoopback(req) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+/** 定长哈希后比较，避免管理令牌比较产生时序侧信道。 */
+function safeEqual(a, b) {
+  const ha = createHash('sha256').update(String(a)).digest();
+  const hb = createHash('sha256').update(String(b)).digest();
+  return timingSafeEqual(ha, hb);
+}
+
 function requireAdmin(ctx, req) {
   const { config } = ctx;
   const token = config.server.adminToken || process.env[config.server.adminTokenEnv || 'CODEFREE_ADMIN_TOKEN'] || '';
@@ -792,7 +804,7 @@ function requireAdmin(ctx, req) {
     const provided = String(req.headers['x-admin-token'] || '').trim();
     const auth = String(req.headers.authorization || '');
     const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-    if (provided !== token && bearer !== token) {
+    if (!safeEqual(provided, token) && !safeEqual(bearer, token)) {
       const err = new Error('管理接口需要 X-Admin-Token');
       err.status = 401;
       err.code = 'admin_unauthorized';
@@ -835,7 +847,7 @@ async function handleAdmin(ctx, req, res, pathname) {
     return sendJson(res, 200, {
       object: 'codefree.accounts',
       fetchedAt: Date.now(),
-      accounts: pool.snapshot(),
+      accounts: pool.snapshot().map((s) => ({ ...s, sessions: affinity.countByAccount(s.id) })),
     });
   }
   if (req.method === 'GET' && pathname === '/admin/quota') {
@@ -860,12 +872,14 @@ async function handleAdmin(ctx, req, res, pathname) {
         id: a.id,
         stats: { ...a.stats },
         leases: a.leases,
+        sessions: affinity.countByAccount(a.id),
         health: a.health,
         cooldownMsLeft: Math.max(0, a.cooldownUntil - Date.now()),
       })),
       consumers: consumers.snapshot(),
       chatInFlight: chatInFlight.total,
       stickySessions: affinity.size(),
+      sessionsByAccount: affinity.countsByAccount(),
       modelsCachedAt: modelsCache.at || null,
     });
   }
@@ -876,6 +890,20 @@ async function handleAdmin(ctx, req, res, pathname) {
     for (const a of pool.list()) a.preferred = a.id === id;
     ctx.logger?.info('已切换首选账号', { account: id });
     return sendJson(res, 200, { object: 'codefree.account', account: account.snapshot() });
+  }
+  if (req.method === 'POST' && /^\/admin\/accounts\/[^/]+\/refresh$/.test(pathname)) {
+    const id = decodeURIComponent(pathname.split('/')[3]);
+    const account = pool.get(id);
+    if (!account) return openAiError(res, 404, `账号不存在：${id}`, 'invalid_request_error', 'account_not_found');
+    try {
+      await pool.ensureFresh(account, { force: true });
+      ctx.alerts?.evaluate(ctx.pool, ctx.quota, { reason: 'admin_refresh' }).catch(() => {});
+      ctx.logger?.info('管理员强制刷新账号成功', { account: id });
+      return sendJson(res, 200, { object: 'codefree.account', account: account.snapshot() });
+    } catch (e) {
+      ctx.logger?.warn('管理员强制刷新账号失败', { account: id, error: String(e?.message || e).slice(0, 200) });
+      return mapError(res, e);
+    }
   }
   if (req.method === 'POST' && /^\/admin\/accounts\/[^/]+\/cooldown$/.test(pathname)) {
     const id = decodeURIComponent(pathname.split('/')[3]);
@@ -1084,6 +1112,8 @@ async function main() {
         account.cooldownUntil = 0;
       }
     }
+    // 自动尝试恢复 auth-expired / 凭据缺失账号（内部按 refresh.authRecoveryMs 节流）
+    ctx.pool.recoverAuthExpired().catch(() => {});
   }, 15000);
   maintenance.unref?.();
 
@@ -1127,6 +1157,7 @@ async function main() {
       accounts: ctx.pool.list().map((a) => ({ id: a.id, userId: a.userId, health: a.health })),
       configFile: cfg.__file || null,
       adminToken: cfg.server.adminToken || process.env[cfg.server.adminTokenEnv] ? 'configured' : 'loopback-only',
+      alerts: cfg.alert.enabled && cfg.alert.webhookUrl ? `enabled(${cfg.alert.msgType || 'text'})` : 'disabled',
     });
   });
 

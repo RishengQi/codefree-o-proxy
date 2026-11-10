@@ -148,7 +148,7 @@ export function startMockUpstream({ accounts } = {}) {
       if (acc.quotaStatus === '401') return send(401, { code: 'CODEFREE_AUTH_REQUIRED' });
       return send(200, {
         level: { level: 'L3', displayName: 'L3' },
-        vip: false,
+        vip: acc.vip ?? false,
         quotaStatus: acc.quotaStatus || 'ACTIVE',
         statusReason: acc.statusReason !== undefined ? acc.statusReason : null,
         fiveHour: acc.fiveHour === null ? null : acc.fiveHour ?? { usagePercent: 10, used: 10, limit: 100, resetAt: Date.now() + 3600_000 },

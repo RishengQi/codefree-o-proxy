@@ -722,21 +722,28 @@ COMMIT;
 - 对 `resetAt` 做**时钟偏移容忍**：若 `resetAt <= now` 但上游仍报耗尽，按 `now + minCooldown(60s)` 处理；
 - 启动时若发现系统时钟跳变（与上次 `savedAt` 偏差 > 5min），强制对全部账号重探测并告警。
 
-**告警阈值**（复用现有企微 webhook 机制）：
+**告警**（实现于 `lib/alerts.mjs`，webhook 地址通过环境变量 `CODEFREE_ALERT_WEBHOOK` 配置）：
 
-| 条件 | 级别 | 动作 |
+| 条件 | 事件 | 去重 |
 |------|------|------|
-| refresh token 剩余 < 2 天 | 预警 | 企微通知（沿用 `check-token-expiry.py` 语义，P1 起读 `state/accounts.json`） |
-| refresh token 已过期 | 告警 | 账号置不可用；若池内无可用账号 → `/admin/health` 503 |
-| 可用账号数 < `minHealthyAccounts` | 告警 | 企微 + 日志 |
-| 单账号连续刷新失败 ≥ 3 | 告警 | 自动 `cooldown` + 通知 |
+| 单账号 401（刷新后仍失败）/ refresh token 失效 / 凭据缺失 | `account_auth_expired` | 状态迁移 + `accountCooldownMs`（默认 6h）提醒 |
+| 窗口 `usagePercent` ≥ 服务端 `thresholdPercent`（缺失回退 `alert.quotaWarnPercent`，默认 80%） | `account_quota_warning` | 每账号/窗口/resetAt 一次 |
+| 窗口 `status=EXHAUSTED` 或 `usagePercent ≥ 100` | `account_quota_exhausted` | 每账号/窗口/resetAt 一次 |
+| `quotaStatus=DEGRADED` 或 `statusReason=CONTROL_DISABLED` | `account_control_disabled` | 每账号/类型 6h |
+| 上游 5xx / 网络 / 未知失败 / 限流导致账号冷却 | `account_upstream_error` | 每账号/类型 6h |
+| refresh token 剩余 < `refreshExpiryWarnHours`（默认 48h） | `refresh_expiring` | 12h |
+| 全池登录失效 / 全池额度耗尽 | `all_auth_expired` / `all_quota_exhausted` | `cooldownMs`（默认 10min） |
+| 账号或全池恢复 | `account_*_recovered` / `recovered` | 状态迁移 |
+
+额度告警资格对齐桌面端：仅 `quotaStatus=ACTIVE && statusReason=null && !vip` 参与判定；
+`BYPASSED` / `OUTSIDE_WORK_TIME` / `VIP` 不产生额度告警。阈值优先取服务端 `thresholdPercent`。
 
 ### 2.6 吊销与失效处理
 
 | 场景 | 检测 | 处理 | 恢复 |
 |------|------|------|------|
-| refresh token 失效（被轮换/过期/注销） | 刷新 400/401 | 账号 `revoked`；从选号候选剔除；告警 | 人工重新登录后 `POST /admin/accounts/:id/reimport` 或重启导入 |
-| access token 失效（上游 401） | chat 401 | 强制刷新一次 → 仍 401 则 `revoked` | 同上 |
+| refresh token 失效（被轮换/过期/注销） | 刷新 400/401 | 账号 `auth-expired`；从选号候选剔除；告警 | 重新登录后 authFile 更新 → 每 `refresh.authRecoveryMs`（默认 10min）自动对账并强制刷新；或 `POST /admin/accounts/:id/refresh` |
+| access token 失效（上游 401） | chat 401 | 强制刷新一次 → 仍 401 则 `auth-expired` | 同上 |
 | 账号被禁用/封禁 | 403 或特定业务码 | `disabled`（人工确认后）；不自动恢复 | 人工 |
 | 账号额度耗尽 | 429/流内错误/探测 | `exhausted` 到 `resetAt` | 自动（到期探测） |
 | 凭据被管理员删除 | Admin | 从池移除；若有粘性会话指向它 → 失效并重新选号 | — |
@@ -1065,22 +1072,28 @@ function computeHeadroom(snap, cfg) {
 
 > 说明：headroom 用**最小周期余量**而非平均值，因为 `5H` 与 `7D` 任一耗尽都会导致请求失败；这比"平均余量"更安全。
 
-### 4.2 粘性会话（Session Affinity）
+### 4.2 按会话负载均衡（Session Affinity + Session Balancing）
 
-**目标**：同一消费者/同一会话尽量固定在同一账号，减少上下文/缓存抖动，同时避免粘死在即将耗尽的账号上。
+**目标**：同一消费者/同一会话固定在同一账号，减少上下文/缓存抖动；同时把新会话均匀分布到各账号，并避免粘死在即将耗尽的账号上。
 
 | 项 | 规则 |
 |----|------|
 | 粘性键 | `consumerId + ":" + sessionKey` |
-| `sessionKey` 来源 | ① 请求头 `x-session-affinity`；② `x-session-id`；③ body `session_id`；④ 若开启隐式粘性：`sha256(system + 首条 user 消息)[0..16]` |
-| 存储 | 内存 Map（`state/sessions.json` 定期快照，重启可恢复；丢失可接受） |
-| TTL | 滑动 30 分钟（`stickyTtlMs`），每次命中续期 |
-| 命中条件 | 目标账号通过 F1~F9，且 `headroom ≥ stickyMinHeadroom`（默认 0.1），且 `score ≥ bestScore × stickyScoreFactor`（默认 0.6） |
-| 失效条件 | quota_exhausted / auth_revoked / 手动禁用 / 账号删除 / TTL 到期 |
-| 保持条件 | rate_limited、5xx、网络错误（换号后仍保留映射，待冷却结束回切） |
-| 容量 | 默认 10,000 条，LRU 淘汰；按 `consumerId` 分桶便于统计 |
+| `sessionKey` 来源 | ① body `session_id`；② body `sessionId`；③ 请求头 `x-session-affinity`；④ 请求头 `x-session-id`（隐式指纹未实现） |
+| 存储 | 内存 Map + 每账号会话计数；**不持久化**，重启后重新分配 |
+| TTL | 滑动 30 分钟（`stickyTtlMs`），选中与成功时续期，`sweep()` 每 15s 清理 |
+| 绑定时机 | `select()` 选中即绑定（防止同会话并发首请求落到不同账号）；`onSuccess` 续期，`onFailure` 解绑 |
+| 硬绑定条件 | 映射账号仍在候选集（enabled、凭据存在、未冷却、`leases < maxConcurrent`、未被本次请求排除、模型未拉黑）且 `headroom ≥ stickyMinHeadroom`（默认 0.1；LEGACY 免额度模型直接视为满足） |
+| 漂移条件 | 硬绑定条件任一不满足 → 按评分重新选号并重新绑定；任何失败都会解绑（含 429/5xx/网络） |
+| 新会话均摊 | `score += weights.sessions × (1 - min(1, 账号会话数 / ref))`；`ref = maxSessionsPerAccount || 候选账号最大会话数`（至少 1） |
+| 单账号上限 | `sessionBalancing.maxSessionsPerAccount`（默认 0 = 不限）只限制新会话；已有绑定的会话不受驱逐；全部账号达上限时自动放宽，不返回 503 |
+| 容量 | `selection.maxSessions`（默认 10000）限制内存映射条数，超出按最近使用淘汰；计数读取前节流 sweep（1s），不再依赖 15s 定时器 |
+| 关闭开关 | `sessionBalancing.enabled=false` 恢复旧的软粘性：`stickyScoreFactor` 加分 + 成功后绑定 |
 
-**为什么需要 `stickyScoreFactor`**：若粘性账号余量 12%、另一账号余量 90%，粘性仍会优先选 12% 账号 → 加速耗尽。用"粘性账号分数不低于最优分数 60%"作为保护阈值，兼顾稳定与负载均衡。
+**为什么用相对会话数而不是 `maxConcurrent` 归一化**：会话是长生命周期的会话线程，可能大部分时间空闲；用请求并发上限做分母会让少量长会话把账号的会话负载项提前压到 0。相对候选账号最大值做归一化才能真正实现「新会话均摊」。
+
+**观测**：`/health` → `pool.sessionsByAccount`、`accountsDetail[].sessions`；`/admin/usage` → `accounts[].sessions`；`/metrics` → `codefree_account_sessions{account,...}`。
+
 
 ### 4.3 冷却与健康状态机
 
@@ -1736,11 +1749,16 @@ node -e "const c=require('node:crypto');const k='sk-cf-'+c.randomBytes(24).toStr
     "redactTokens": true,
     "dir": "./state/logs"
   },
-  "alerts": {
-    "wecomWebhook": "",
-    "refreshExpiryWarningDays": 2,
-    "minHealthyAccounts": 1,
-    "suppressMinutes": 60
+  "alert": {
+    "enabled": false,
+    "webhookUrl": "",
+    "msgType": "text",
+    "cooldownMs": 600000,
+    "accountCooldownMs": 21600000,
+    "quotaWarnPercent": 80,
+    "refreshExpiryWarnHours": 48,
+    "mentionedList": [],
+    "mentionedMobileList": []
   }
 }
 ```

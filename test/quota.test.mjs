@@ -1,7 +1,7 @@
 // 额度工具单测：工作时段判断 / 摘要归一
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { quotaWorkTimeActive, summarizeQuota } from '../lib/quota.mjs';
+import { quotaWorkTimeActive, summarizeQuota, QuotaService, extractQuotaSignal } from '../lib/quota.mjs';
 
 test('quotaWorkTimeActive：工作时段内/外判断', () => {
   const workTime = { timeZone: 'Asia/Shanghai', startTime: '08:30', endTime: '17:30' };
@@ -38,4 +38,35 @@ test('summarizeQuota：窗口与工作时段归一', () => {
   assert.equal(snap.exhausted, true);
   assert.ok(snap.quotaWorkTime);
   assert.equal(snap.canUpgrade, true);
+});
+
+test('recordPassive：保留服务端 thresholdPercent/windowId/eventId', () => {
+  const svc = new QuotaService({
+    config: { quota: { assumeUnknownHeadroom: 0.5, probe: { hourlyBudget: 10 } } },
+    logger: null,
+  });
+  const signal = extractQuotaSignal({
+    data: {
+      codefree: {
+        notifications: [
+          {
+            type: 'QUOTA_WARNING',
+            period: '5H',
+            usagePercent: 85,
+            resetAt: 1794300000000,
+            eventId: 'evt-1',
+            thresholdPercent: 70,
+            windowId: 'win-1',
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(signal.kind, 'warning');
+  svc.recordPassive('acc-a', signal);
+  const w = svc.get('acc-a').windows['5H'];
+  assert.equal(w.usagePercent, 85);
+  assert.equal(w.thresholdPercent, 70, '被动信号应保留服务端阈值');
+  assert.equal(w.windowId, 'win-1');
+  assert.equal(w.eventId, 'evt-1');
 });

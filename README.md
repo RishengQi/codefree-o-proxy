@@ -160,6 +160,15 @@ journalctl -u codefree-o-proxy -f
 | `CODEFREE_TIMEOUT_MS` | `180000` | 上游超时 |
 | `CODEFREE_DEBUG` | 空 | `1` 打开 debug 日志 |
 | `CODEFREE_STATE_FILE` | `./.auth-state.json` | 运行状态快照（gitignore） |
+| `CODEFREE_ALERT_WEBHOOK` | 空 | 企微群机器人 webhook（设置后自动启用告警） |
+| `CODEFREE_ALERT_WEBHOOK_TIMEOUT_MS` | `10000` | 企微 webhook 请求超时 |
+| `CODEFREE_ALERT_COOLDOWN_MS` | `600000` | 池级告警冷却 |
+| `CODEFREE_ALERT_ACCOUNT_COOLDOWN_MS` | `21600000` | 账号级告警冷却（6 小时） |
+| `CODEFREE_QUOTA_WARN_PERCENT` | `80` | 服务端未下发 `thresholdPercent` 时的额度预警阈值 |
+| `CODEFREE_ALERT_MSG_TYPE` | `text` | `text` / `markdown` |
+| `CODEFREE_ALERT_MENTION` | 空 | text 消息 @ 成员（逗号分隔，`@all` 可 @ 所有人） |
+| `CODEFREE_ALERT_MENTION_MOBILE` | 空 | text 消息 @ 手机号（逗号分隔） |
+| `CODEFREE_REFRESH_WARN_HOURS` | `48` | refresh token 过期预警小时数 |
 
 ## 对外接口
 
@@ -458,7 +467,8 @@ curl -X POST http://127.0.0.1:8787/admin/import `
 
 - **额度感知**：主动探测 `GET /api/aebackend/quota/v1/me`（5H/7D 双窗口）+ 聊天响应内联
   `QUOTA_WARNING` / 429 `AI_QUOTA_EXHAUSTED` 被动校验；额度耗尽按 `resetAt` 冷却。
-- **选号**：headroom 加权 + 健康度 + 负载 + 优先级 + 首选账号；同 session 粘性（TTL 30 分钟）；
+- **选号**：headroom 加权 + 健康度 + 负载 + 优先级 + 首选账号 + 会话负载；
+  同 session 硬绑定（原账号可调度时固定使用，TTL 30 分钟）；新 session 按会话数均摊；
   每账号并发租约；失败分类（额度/鉴权/限流/5xx/网络/模型）分别冷却或拉黑模型。
 - **故障切换**：429 额度、401 鉴权、5xx、网络错误自动换号重试（≤3 次尝试、≤2 个账号）；
   SSE 已开始输出后不再切换。
@@ -473,6 +483,7 @@ curl -X POST http://127.0.0.1:8787/admin/import `
 | GET | `/admin/quota` | 全部账号额度与 headroom |
 | GET | `/admin/usage` | 账号/消费者用量、并发、粘性会话数 |
 | POST | `/admin/accounts/:id/activate` | 设为首选账号 |
+| POST | `/admin/accounts/:id/refresh` | 强制刷新 token（可用于恢复 `auth-expired` 账号） |
 | POST | `/admin/accounts/:id/cooldown` | 手动冷却 `{ms,reason}` / `{clear:true}` |
 | POST | `/admin/quota/probe` | 主动探测（可指定 `{accountId}`） |
 | GET | `/admin/consumers` | 消费者列表（Key 脱敏） |
@@ -483,6 +494,36 @@ curl -X POST http://127.0.0.1:8787/admin/import `
 | POST | `/admin/usage/save` | 手动落盘用量统计 |
 | POST | `/admin/import` | 导入 `codefree.json` 账号 |
 | POST | `/admin/reload` | 清理缓存（账号增删建议重启） |
+
+### 按会话负载均衡
+
+同一会话（`body.session_id` / `body.sessionId` / `x-session-affinity` / `x-session-id`，
+按消费者隔离）首次请求即绑定账号：
+
+- **硬绑定**：原账号未冷却、未达并发上限、模型可用且余量 ≥ `stickyMinHeadroom` 时，
+  后续请求固定走该账号，不再被其他账号的评分抢走；条件不满足时自动换号并重新绑定。
+- **新会话均摊**：评分新增会话负载项 `weights.sessions × (1 - 账号会话数 / 参考容量)`，
+  新会话优先分给会话数更少的账号；`sessionBalancing.maxSessionsPerAccount` 可限制
+  单账号最多绑定多少新会话（0 = 不限；全部账号达上限时自动放宽，不拒绝请求）。
+- **仅内存**：映射不落盘，重启后会话重新分配；TTL 默认 30 分钟（`stickyTtlMs`），
+  选中与成功请求都会续期。`selection.maxSessions`（默认 10000）限制映射条数，
+  超出按最近使用淘汰；读取计数前会节流清理过期映射，不再依赖 15s 定时器。
+- **登录恢复**：`auth-expired` / 凭据缺失账号会按 `refresh.authRecoveryMs`（默认 10 分钟）
+  自动对账凭据文件并尝试强制刷新；也可手动 `POST /admin/accounts/:id/refresh`。
+- **关闭开关**：`selection.sessionBalancing.enabled=false` 恢复旧的软粘性行为
+  （仅 `stickyScoreFactor` 加分，成功后才绑定）。
+
+```json
+"selection": {
+  "stickyTtlMs": 1800000,
+  "maxSessions": 10000,
+  "weights": { "headroom": 1.0, "health": 0.5, "load": 0.5, "priority": 0.2, "preferred": 0.3, "sessions": 0.5 },
+  "sessionBalancing": { "enabled": true, "maxSessionsPerAccount": 0 }
+}
+```
+
+观测：`/health` 的 `pool.sessionsByAccount`、`/admin/usage` 的 `accounts[].sessions`、
+`/metrics` 的 `codefree_account_sessions{account,...}`。
 
 ### 真实双账号验收（2026-11-10）
 
@@ -561,7 +602,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\issue-consumer-key
 ### 回归测试
 
 ```powershell
-npm run test:pool     # 10 项：选号/额度/429 failover/401 刷新/粘性/消费者限流/管理面/Prometheus 指标与用量持久化/全池告警
+npm run test:pool     # 55 项：选号/额度/429 failover/401 刷新/粘性/会话均摊与硬绑定/消费者限流/管理面/Prometheus 指标与用量持久化/账号级与池级告警
 ```
 
 测试使用 `test/mock-upstream.mjs` 模拟 OAuth（含 refresh token 轮换）、模型、额度、聊天与 429，
@@ -584,7 +625,7 @@ curl -H "X-Admin-Token: <token>" http://127.0.0.1:8787/admin/metrics   # 管理�
 | `codefree_proxy_info` / `codefree_proxy_uptime_seconds` | 运行模式、上游、版本、运行时长 |
 | `codefree_accounts{state=total\|enabled\|ready\|cooling\|auth_expired\|disabled}` | 账号状态计数 |
 | `codefree_account_info{account,user_id,health,write_back}` | 账号静态信息 |
-| `codefree_account_leases` / `codefree_account_cooldown_seconds` | 并发租约、冷却剩余 |
+| `codefree_account_leases` / `codefree_account_sessions` / `codefree_account_cooldown_seconds` | 并发租约、绑定会话数、冷却剩余 |
 | `codefree_account_requests_total` / `_successes_total` / `_failures_total` | 请求计数（counter） |
 | `codefree_account_tokens_total{direction=in\|out}` | token 用量（counter） |
 | `codefree_account_last_latency_ms` / `_last_used_timestamp_seconds` | 最近延迟/使用时间 |
@@ -610,21 +651,46 @@ scrape_configs:
 - 启动时自动恢复，重启不丢统计；
 - 手动落盘：`POST /admin/usage/save`（需管理令牌）。
 
-### 全池告警（企业微信等 text webhook）
+### 告警（企业微信群机器人 webhook）
 
-`config.json` 中配置（或环境变量 `CODEFREE_ALERT_WEBHOOK` + `CODEFREE_ALERT_COOLDOWN_MS`）：
+webhook 地址从**环境变量**读取（推荐，避免把密钥写进 `config.json`）：
 
-```json
-{ "alert": { "enabled": true, "webhookUrl": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx", "cooldownMs": 600000 } }
+```powershell
+$env:CODEFREE_ALERT_WEBHOOK = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx'
+node server.mjs
 ```
+
+设置 `CODEFREE_ALERT_WEBHOOK` 会自动启用告警。其它可选环境变量：
+`CODEFREE_ALERT_COOLDOWN_MS`、`CODEFREE_ALERT_ACCOUNT_COOLDOWN_MS`、
+`CODEFREE_QUOTA_WARN_PERCENT`、`CODEFREE_ALERT_MSG_TYPE`、`CODEFREE_ALERT_MENTION`、
+`CODEFREE_ALERT_MENTION_MOBILE`、`CODEFREE_REFRESH_WARN_HOURS`。
+
+`alert.webhookUrl` 仍可作为配置文件回退（不推荐把 webhook key 提交到仓库）。
 
 触发事件：
 
-- `all_quota_exhausted`：全部账号额度耗尽（冷却原因为 quota 或额度窗口 100%）；
-- `all_auth_expired`：全部账号登录失效；
-- `recovered`：从异常状态恢复（至少一个账号可用）。
+| 事件 | 说明 |
+|------|------|
+| `account_auth_expired` | 单账号 401（刷新后仍失败）、refresh token 失效或凭据缺失 → 账号 `auth-expired` |
+| `account_quota_warning` | 5H/7D 窗口 `usagePercent` ≥ 服务端 `thresholdPercent`（缺失时回退 `quotaWarnPercent`，默认 80%） |
+| `account_quota_exhausted` | 窗口 `status=EXHAUSTED` 或 `usagePercent ≥ 100` |
+| `account_control_disabled` | `quotaStatus=DEGRADED` 或 `statusReason=CONTROL_DISABLED`（账号被服务端限流/控制） |
+| `account_upstream_error` | 上游 5xx / 网络 / 未知失败 / 限流导致账号冷却 |
+| `refresh_expiring` | refresh token 将在 `refreshExpiryWarnHours`（默认 48h）内过期 |
+| `all_auth_expired` / `all_quota_exhausted` | 全池登录失效 / 全池额度耗尽 |
+| `account_auth_recovered` / `account_quota_recovered` / `account_control_recovered` / `recovered` | 账号或全池从异常状态恢复 |
 
-消息为企微 text 格式，含各账号 health/cooldown/quota/windows 摘要；同一事件受 `cooldownMs` 限流。
+说明：
+
+- 额度判定对齐 CodeFree-O 桌面端：仅 `quotaStatus=ACTIVE && statusReason=null && !vip` 参与预警；
+  `BYPASSED`、`OUTSIDE_WORK_TIME`、`VIP` 不产生额度告警。
+- 阈值优先使用服务端下发的 `thresholdPercent`，缺失时才回退 `alert.quotaWarnPercent`。
+- 同一账号/窗口/重置周期内去重；账号级事件默认 6 小时冷却（`accountCooldownMs`），
+  池级事件默认 10 分钟（`cooldownMs`）。
+- `msgType: "markdown"` 发送企微 markdown；`mentionedList` / `mentionedMobileList`
+  用于 text 消息 @ 成员（`["@all"]` 可 @ 所有人）。
+- 企微即使业务失败也返回 HTTP 200，代理会检查响应体 `errcode` 并在非 0 时记录告警日志。
+- 消息按企微限制自动截断（text 2048 字节 / markdown 4096 字节）。
 
 ## 设计与侦察文档
 
