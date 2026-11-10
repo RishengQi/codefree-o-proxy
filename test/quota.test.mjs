@@ -70,3 +70,65 @@ test('recordPassive：保留服务端 thresholdPercent/windowId/eventId', () => 
   assert.equal(w.windowId, 'win-1');
   assert.equal(w.eventId, 'evt-1');
 });
+
+test('recordPassive：新窗口 warning 清除旧 EXHAUSTED 状态', () => {
+  const svc = new QuotaService({
+    config: { quota: { assumeUnknownHeadroom: 0.5, probe: { hourlyBudget: 10 } } },
+    logger: null,
+  });
+  const r1 = Date.now() + 60_000;
+  svc.recordPassive(
+    'acc-a',
+    extractQuotaSignal({ code: 'AI_QUOTA_EXHAUSTED', periods: ['5H'], used: 100, limit: 100, resetAt: r1 }),
+  );
+  assert.equal(svc.get('acc-a').windows['5H'].status, 'EXHAUSTED');
+  assert.equal(svc.get('acc-a').exhausted, true);
+
+  const r2 = r1 + 60_000;
+  svc.recordPassive(
+    'acc-a',
+    extractQuotaSignal({
+      data: {
+        codefree: {
+          notifications: [
+            { type: 'QUOTA_WARNING', period: '5H', usagePercent: 85, resetAt: r2, eventId: 'e2', thresholdPercent: 80 },
+          ],
+        },
+      },
+    }),
+  );
+  const w = svc.get('acc-a').windows['5H'];
+  assert.equal(w.status, 'ACTIVE', '新窗口 warning 不应保留旧 EXHAUSTED');
+  assert.equal(w.usagePercent, 85);
+  assert.equal(w.retryAt, undefined, '旧 retryAt 应被清除');
+  assert.equal(svc.get('acc-a').exhausted, false);
+});
+
+test('recordProbe：缺失窗口不再沿用旧状态', () => {
+  const svc = new QuotaService({
+    config: { quota: { assumeUnknownHeadroom: 0.5, probe: { hourlyBudget: 10 } } },
+    logger: null,
+  });
+  const resetAt = Date.now() + 60_000;
+  svc.recordProbe(
+    'acc-a',
+    summarizeQuota({
+      data: {
+        quotaStatus: 'ACTIVE',
+        fiveHour: { usagePercent: 100, used: 100, limit: 100, resetAt },
+        sevenDay: { usagePercent: 50, used: 500, limit: 1000, resetAt },
+      },
+    }),
+  );
+  assert.ok(svc.get('acc-a').windows['5H']);
+  assert.ok(svc.get('acc-a').windows['7D']);
+
+  svc.recordProbe(
+    'acc-a',
+    summarizeQuota({
+      data: { quotaStatus: 'ACTIVE', fiveHour: { usagePercent: 10, used: 10, limit: 100, resetAt } },
+    }),
+  );
+  assert.ok(svc.get('acc-a').windows['5H']);
+  assert.equal(svc.get('acc-a').windows['7D'], undefined, '探测响应缺失的窗口应被移除');
+});

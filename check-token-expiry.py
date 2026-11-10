@@ -72,11 +72,12 @@ def send_wecom(key, text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=float, default=2.0, help="剩余天数阈值（默认 2 天）")
-    ap.add_argument("--webhook", default=DEFAULT_WEBHOOK)
+    ap.add_argument("--webhook", default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    if args.webhook and not os.environ.get("CODEFREE_ALERT_WEBHOOK"):
+    if args.webhook is not None:
         log("提示：建议使用环境变量 CODEFREE_ALERT_WEBHOOK，避免 --webhook 出现在命令历史/进程列表")
+    webhook = args.webhook if args.webhook is not None else DEFAULT_WEBHOOK
 
     expires_at, source = load_expiry()
     if not expires_at:
@@ -116,11 +117,11 @@ def main():
     if args.dry_run:
         log("[dry-run] 将推送:\n" + text)
         return 0
-    if not args.webhook:
+    if not webhook:
         log("未配置企微 webhook（CODEFREE_ALERT_WEBHOOK 或 --webhook），跳过推送")
         return 0
 
-    resp = send_wecom(args.webhook, text)
+    resp = send_wecom(webhook, text)
     log(f"企微推送返回: {resp}")
     if '"errcode":0' in resp.replace(" ", ""):
         ALERT_STATE.write_text(

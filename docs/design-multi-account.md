@@ -1085,7 +1085,7 @@ function computeHeadroom(snap, cfg) {
 | 绑定时机 | `select()` 选中即绑定（防止同会话并发首请求落到不同账号）；`onSuccess` 续期，`onFailure` 解绑 |
 | 硬绑定条件 | 映射账号仍在候选集（enabled、凭据存在、未冷却、`leases < maxConcurrent`、未被本次请求排除、模型未拉黑）且 `headroom ≥ stickyMinHeadroom`（默认 0.1；LEGACY 免额度模型直接视为满足） |
 | 漂移条件 | 硬绑定条件任一不满足 → 按评分重新选号并重新绑定；任何失败都会解绑（含 429/5xx/网络） |
-| 新会话均摊 | `score += weights.sessions × (1 - min(1, 账号会话数 / ref))`；`ref = maxSessionsPerAccount || 候选账号最大会话数`（至少 1） |
+| 新会话均摊 | `score += weights.sessions × (1 - 账号会话数 / ref)`（允许负值，避免溢出账号被打平）；`ref = maxSessionsPerAccount || 候选账号最大会话数`（至少 1） |
 | 单账号上限 | `sessionBalancing.maxSessionsPerAccount`（默认 0 = 不限）只限制新会话；已有绑定的会话不受驱逐；全部账号达上限时自动放宽，不返回 503 |
 | 容量 | `selection.maxSessions`（默认 10000）限制内存映射条数，超出按最近使用淘汰；计数读取前节流 sweep（1s），不再依赖 15s 定时器 |
 | 关闭开关 | `sessionBalancing.enabled=false` 恢复旧的软粘性：`stickyScoreFactor` 加分 + 成功后绑定 |

@@ -602,7 +602,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\issue-consumer-key
 ### 回归测试
 
 ```powershell
-npm run test:pool     # 55 项：选号/额度/429 failover/401 刷新/粘性/会话均摊与硬绑定/消费者限流/管理面/Prometheus 指标与用量持久化/账号级与池级告警
+npm run test:pool     # 59 项：选号/额度/429 failover/401 刷新/粘性/会话均摊与硬绑定/消费者限流/管理面/Prometheus 指标与用量持久化/账号级与池级告警
 ```
 
 测试使用 `test/mock-upstream.mjs` 模拟 OAuth（含 refresh token 轮换）、模型、额度、聊天与 429，

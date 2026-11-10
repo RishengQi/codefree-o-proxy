@@ -11,7 +11,7 @@ import path from 'node:path';
 import { startMockUpstream } from './mock-upstream.mjs';
 import { WeComWebhook } from '../lib/wecom.mjs';
 import { AlertManager } from '../lib/alerts.mjs';
-import { SessionAffinity } from '../lib/pool.mjs';
+import { AccountPool, SessionAffinity } from '../lib/pool.mjs';
 import { deepMerge } from '../lib/util.mjs';
 
 const REPO = path.resolve(import.meta.dirname, '..');
@@ -855,6 +855,38 @@ test('会话失败漂移：换号后重新绑定，不回到原账号', async ()
   }
 });
 
+test('maxSessionsPerAccount：达上限后新会话强制分到其他账号', async () => {
+  const env = await setup({
+    quotaProbe: true,
+    selection: { weights: { sessions: 0 }, sessionBalancing: { enabled: true, maxSessionsPerAccount: 1 } },
+    accounts: {
+      'r-a': {
+        accessToken: 'tok-a',
+        userId: '111',
+        fiveHour: { usagePercent: 10, used: 10, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+      'r-b': {
+        accessToken: 'tok-b',
+        userId: '222',
+        fiveHour: { usagePercent: 80, used: 80, limit: 100, resetAt: Date.now() + 3600_000 },
+      },
+    },
+  });
+  try {
+    await env.admin('/admin/quota/probe', { method: 'POST' });
+    for (const sid of ['cap-a1', 'cap-b1', 'cap-c1']) {
+      const res = await env.chat({ session_id: sid });
+      assert.equal(res.status, 200);
+    }
+    const calls = chatCalls(env.mock).map((c) => c.account);
+    assert.equal(calls[0], 'r-a', '第一个 session 应按余量选 r-a');
+    assert.equal(calls[1], 'r-b', 'r-a 达上限后应强制分到 r-b，即使 r-a 评分更高');
+    assert.equal(calls[2], 'r-a', '全部达上限后应放宽限制并按评分选 r-a');
+  } finally {
+    await env.close();
+  }
+});
+
 test('maxSessionsPerAccount：新会话避开已达上限的账号，全满时仍均摊', async () => {
   const env = await setup({ selection: { sessionBalancing: { enabled: true, maxSessionsPerAccount: 1 } } });
   try {
@@ -1138,6 +1170,11 @@ test('企微 webhook 识别 errcode 非 0 与非 JSON 响应', async () => {
     res.end('<html>gateway error</html>');
   });
   await new Promise((r) => html.listen(0, '127.0.0.1', r));
+  const nullCode = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"errcode":null}');
+  });
+  await new Promise((r) => nullCode.listen(0, '127.0.0.1', r));
   try {
     const wc1 = new WeComWebhook({ url: `http://127.0.0.1:${bad.address().port}/hook` });
     const r1 = await wc1.send('hello');
@@ -1147,9 +1184,14 @@ test('企微 webhook 识别 errcode 非 0 与非 JSON 响应', async () => {
     const wc2 = new WeComWebhook({ url: `http://127.0.0.1:${html.address().port}/hook` });
     const r2 = await wc2.send('hello');
     assert.equal(r2.ok, false, 'HTTP 200 但非 JSON 应视为失败');
+
+    const wc3 = new WeComWebhook({ url: `http://127.0.0.1:${nullCode.address().port}/hook` });
+    const r3 = await wc3.send('hello');
+    assert.equal(r3.ok, false, 'errcode:null 不应视为成功');
   } finally {
     await new Promise((r) => bad.close(r));
     await new Promise((r) => html.close(r));
+    await new Promise((r) => nullCode.close(r));
   }
 });
 
@@ -1588,6 +1630,160 @@ test('企微消息按 UTF-8 字节上限截断', async () => {
   } finally {
     await hook.close();
   }
+});
+
+test('额度恢复：跨窗口重置发恢复，额度失效不误报恢复', async () => {
+  const hook = await startAlertHook();
+  const alerts = new AlertManager({
+    config: { alert: { enabled: true, webhookUrl: hook.url, quotaWarnPercent: 80 } },
+    logger: null,
+  });
+  const account = {
+    id: 'acc-a',
+    userId: '111',
+    enabled: true,
+    credentialMissing: false,
+    health: 'ready',
+    cooldownReason: '',
+    cooldownUntil: 0,
+    stats: {},
+  };
+  const pool = { list: () => [account] };
+  const r1 = Date.now() + 60_000;
+  let snap = {
+    enforced: true,
+    quotaStatus: 'ACTIVE',
+    windows: { '5H': { usagePercent: 100, status: 'EXHAUSTED', resetAt: r1 } },
+  };
+  const quota = { get: () => snap };
+  try {
+    await alerts.evaluate(pool, quota, { reason: 't1' });
+    assert.ok(hook.captured.some((b) => alertContent(b).includes('账号额度耗尽')));
+
+    // 新窗口 10%：跨 resetAt 也应发恢复
+    const r2 = r1 + 60_000;
+    snap = {
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 10, status: 'ACTIVE', resetAt: r2 } },
+    };
+    await alerts.evaluate(pool, quota, { reason: 't2' });
+    assert.ok(hook.captured.some((b) => alertContent(b).includes('账号额度恢复')), '跨窗口重置应发恢复');
+
+    // 再次预警后额度失效（BYPASSED）：不应发“额度恢复”
+    snap = {
+      enforced: true,
+      quotaStatus: 'ACTIVE',
+      windows: { '5H': { usagePercent: 85, status: 'ACTIVE', resetAt: r2, thresholdPercent: 80 } },
+    };
+    await alerts.evaluate(pool, quota, { reason: 't3' });
+    const before = hook.captured.filter((b) => alertContent(b).includes('账号额度恢复')).length;
+
+    snap = {
+      enforced: false,
+      bypassed: true,
+      quotaStatus: 'BYPASSED',
+      windows: { '5H': { usagePercent: 85, status: 'ACTIVE', resetAt: r2, thresholdPercent: 80 } },
+    };
+    await alerts.evaluate(pool, quota, { reason: 't4' });
+    const after = hook.captured.filter((b) => alertContent(b).includes('账号额度恢复')).length;
+    assert.equal(after, before, '额度失效时不应误报额度恢复');
+  } finally {
+    await hook.close();
+  }
+});
+
+test('凭据缺失恢复：刷新失败不提前启用账号', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'cf-pool-auth-'));
+  const authFile = path.join(dir, 'codefree.json');
+  const config = {
+    stateDir: dir,
+    upstream: {
+      baseUrl: 'http://127.0.0.1:1',
+      clientId: 'test-client',
+      clientSecret: '',
+      signingSecret: '',
+      version: '1.0.0',
+      subService: 'test',
+      userAgent: 'test',
+      requestTimeoutMs: 1000,
+      refreshTimeoutMs: 1000,
+      quotaTimeoutMs: 1000,
+    },
+    refresh: { skewMs: 1000, maxRetries: 1, backoffMs: [1], authRecoveryMs: 600000 },
+    selection: { stickyTtlMs: 1000, maxSessions: 10 },
+    quota: { assumeUnknownHeadroom: 0.5, probe: { hourlyBudget: 10 } },
+    journal: { file: path.join(dir, 'journal.jsonl'), enabled: false },
+  };
+  let fail = true;
+  const upstream = {
+    refreshToken: async () => {
+      if (fail) throw new Error('network down');
+      return {
+        accessToken: 'at-1',
+        accessTokenExpiresAt: Date.now() + 3600_000,
+        refreshToken: 'rt-2',
+        refreshTokenExpiresAt: Date.now() + 86400_000,
+        userId: '111',
+      };
+    },
+  };
+  const pool = new AccountPool({
+    config,
+    logger: null,
+    upstream,
+    journal: { append() {}, lastByAccount: () => new Map() },
+    quota: { get: () => null },
+  });
+  try {
+    await pool.load([
+      {
+        id: 'acc-a',
+        baseUrl: config.upstream.baseUrl,
+        refreshToken: '',
+        writeBack: 'isolated',
+        authFile,
+        enabled: true,
+      },
+    ]);
+    const account = pool.get('acc-a');
+    assert.equal(account.credentialMissing, true);
+    assert.equal(account.enabled, false);
+
+    // 用户重新登录后 authFile 出现新 token，但上游刷新失败
+    writeFileSync(
+      authFile,
+      JSON.stringify({ version: 2, refreshCfToken: 'rt-1', refreshCfTokenExpiresAt: Date.now() + 86400_000 }),
+      'utf8',
+    );
+    await assert.rejects(() => pool.ensureFresh(account, { force: true }));
+    assert.equal(account.credentialMissing, true, '刷新失败不应清除凭据缺失');
+    assert.equal(account.enabled, false, '刷新失败不应启用账号');
+    assert.notEqual(account.health, 'ready');
+
+    // 上游恢复后，自动恢复循环应成功启用账号
+    fail = false;
+    account.stats.lastAuthRetryAt = 0;
+    await pool.recoverAuthExpired();
+    assert.equal(account.credentialMissing, false);
+    assert.equal(account.enabled, true);
+    assert.equal(account.health, 'ready');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionAffinity：超长 session key 哈希存储且映射稳定', () => {
+  const affinity = new SessionAffinity({
+    config: { selection: { stickyTtlMs: 60000, maxSessions: 10 } },
+    logger: null,
+  });
+  const long = 'x'.repeat(1000);
+  affinity.set('c', long, 'a');
+  assert.equal(affinity.get('c', long), 'a');
+  assert.equal(affinity.size(), 1);
+  const storedKey = [...affinity.map.keys()][0];
+  assert.ok(storedKey.length < 300, `存储键过长：${storedKey.length}`);
 });
 
 test('deepMerge 忽略原型污染键', () => {
